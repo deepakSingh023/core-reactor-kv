@@ -1,0 +1,14 @@
+[package]
+name = "core-reactor-kv"
+authors = ["Deepak Singh <dsinghrana71@gmail.com>"]
+version = "0.1.0"
+edition = "2024"
+description = "A thread-per-core, shared-nothing distributed key-value store utilizing edge-triggered epoll/io_uring reactors."
+
+[dependencies]
+libc = "0.2.189"
+nix = { version = "0.31.3", features = ["event"] }
+
+[[bin]]
+name = "core-reactor-kv"
+path = "src/main.rs"
