@@ -11,6 +11,10 @@ use nix::sys::epoll::{
     EpollFlags,
 };
 use socket2::SockAddr;
+mod node;
+mod raft;
+
+use node::node::Node;
 enum ConnType {
     Listener,
     Client,   
@@ -25,7 +29,9 @@ struct Conn {
 struct CoreLocalReactor {
     connections: HashMap<i32, Conn>,
 }
-
+pub mod raft_proto {
+    tonic::include_proto!("raft");
+}
 fn main() -> Result<(), std::io::Error> {
 
     // Number of cores/threads used by the reactor.
