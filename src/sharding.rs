@@ -1,8 +1,4 @@
-/// Takes a client's key string and computes which core shard (0, 1, 2, or 3) owns it.
-/// 
-/// INTERVIEW DEFENSE NOTE: 
-/// This uses the classic "djb2" string hashing algorithm. It is highly valued in 
-/// systems programming because it achieves an even distribution of keys across 
+
 /// cores using fast, hardware-efficient bitwise operations without any memory allocations.
 pub fn calculate_shard(key: &str) -> usize {
     // 5381 is an empirical prime number used as the starting point.

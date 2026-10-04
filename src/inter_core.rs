@@ -4,10 +4,7 @@ use std::os::fd::RawFd;
 use crossbeam_channel::{Receiver, Sender};
 use crate::Conn;
 /*
- ===================================================================================
-  INTERVIEW DEFENSE GUIDE: BARE-METAL INTER-CORE DESCRIPTOR LEAPFROG
- ===================================================================================
-  
+
   THE PROBLEM:
   Our 4 cores share a single client-facing port (e.g., 8080) using Linux SO_REUSEPORT. 
   The Linux kernel randomly balances incoming client sockets across the cores. If Core 1 

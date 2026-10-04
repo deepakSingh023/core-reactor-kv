@@ -8,21 +8,29 @@ use nix::sys::epoll::{
     EpollEvent,
     EpollFlags,
 };
-mod node;
-mod raft;
-
+mod election;
+use sharding::calculate_shard;
+use inter_core::InterCoreMessage;
+mod state;      // Points directly to your src/state.rs file
+      // Points directly to your src/raft.rs file
+mod message;    // Points directly to your src/message.rs file
 mod sharding;
 mod inter_core;
 use crossbeam_channel::{unbounded, Sender, Receiver};
-use sharding::calculate_shard;
-use inter_core::InterCoreMessage;
 
+use state::{RaftState, Role};
+use message::{RequestVote, VoteResponse, AppendEntries, AppendEntriesResponse};
+mod raft_net;
+// In main.rs
 #[derive(Debug)]
 enum ConnType {
     Listener,
     Client, 
-    Doorbell
+    Doorbell,
+    RaftServer, // Listens for new incoming peer network dials
+    RaftPeer,   // An active data channel link with a peer node core
 }
+
 
 #[derive(Debug)]
 struct Conn {
@@ -39,6 +47,17 @@ pub mod raft_proto {
     tonic::include_proto!("raft");
 }
 fn main() -> Result<(), std::io::Error> {
+
+    // Collect command line arguments: cargo run -- <node_id>
+    let args: Vec<String> = std::env::args().collect();
+    let my_node_id: u64 = if args.len() > 1 {
+        args[1].parse().unwrap_or(0)
+    } else {
+        0 // Fallback default to Node 0 if no argument passed
+    };
+
+    let total_cores = 4;
+
 
     // Number of cores/threads used by the reactor.
     let total_cores = 4;
@@ -106,6 +125,26 @@ fn main() -> Result<(), std::io::Error> {
 
             let mut local_kv_store: HashMap<String,String> = HashMap::new();
 
+            let mut raft_state = RaftState {
+                node_id: my_node_id,
+                current_term: 0,
+                voted_for: None,
+                role: Role::Follower,
+                leader_id: None,
+                votes_received: std::collections::HashSet::new(),
+                election_elapsed: 0,
+                // Every core shard gets a unique timeout window to ensure one node wins clearly
+                election_timeout: 15 + (core_id as u64 * 5), 
+                heartbeat_elapsed: 0,
+                heartbeat_interval: 3, // Leaders pulse a heartbeat every 3 ticks (300ms)
+            };
+
+
+
+            // A single call boots up the whole sharded Raft network stack for this thread!
+            let mut raft_network = raft_net::CoreRaftNetwork::new(my_node_id, core_id, 4);
+
+
             //Instead of blindly opening a listener it goes into linux kernel and get a raw unconfigured network file descriptor
             let socket = socket2::Socket::new(socket2::Domain::IPV4,socket2::Type::STREAM, Some(socket2::Protocol::TCP)).unwrap();
             
@@ -113,7 +152,9 @@ fn main() -> Result<(), std::io::Error> {
             socket.set_reuse_port(true).unwrap();
 
        
-            let address : std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+            let current_client_port = 8080 + my_node_id; 
+            let address : std::net::SocketAddr = format!("127.0.0.1:{}", current_client_port).parse().unwrap();
+            
             socket.bind(&socket2::SockAddr::from(address)).unwrap();
 
             socket.listen(128).unwrap();
@@ -173,16 +214,39 @@ fn main() -> Result<(), std::io::Error> {
                 conn_type: ConnType::Doorbell,
             };
             connections.insert(my_eventfd, doorbell_conn);
+
+            // --- REGISTER YOUR PRIVATE CONSENSUS SERVER PORT INTO THE SAME EPOLL ENGINE ---
+            let raft_server_event = EpollEvent::new(EpollFlags::EPOLLIN, raft_network.listener_fd as u64);
+            unsafe {
+                let borrowed_raft_fd = std::os::fd::BorrowedFd::borrow_raw(raft_network.listener_fd);
+                if let Err(e) = epoll.add(&borrowed_raft_fd, raft_server_event) {
+                    eprintln!("[Core {}] Failed to add Raft server fd to epoll: {}", core_id, e);
+                    return;
+                }
+            }
+            
+            // Map it into our connections map using our new ConnType tag variant
+            let raft_server_conn = Conn {
+                fd: raft_network.listener_fd,
+                stream: None,
+                input_buffer: Vec::new(),
+                output_buffer: Vec::new(),
+                conn_type: ConnType::RaftServer, // <--- Tells epoll: "This is a peer node knocking"
+            };
+            connections.insert(raft_network.listener_fd, raft_server_conn);
+            
             
         
             let mut events = [EpollEvent::empty(); 64];
         
             loop {
                 
-                //Wait for the event while the thread sleeps then the ready connections can be accessed from the events array
+      
+                let timeout = nix::sys::epoll::EpollTimeout::try_from(100).unwrap();
+
                 let epoll_count = match epoll.wait(
                     &mut events,
-                    nix::sys::epoll::EpollTimeout::NONE
+                    timeout // ✨ Fixed cleanly!
                 ) {
                     Ok(count) => count,
                     Err(e) => {
@@ -190,6 +254,47 @@ fn main() -> Result<(), std::io::Error> {
                         continue;
                     }
                 };
+
+
+
+
+                if epoll_count == 0 {
+                    raft_network.retry_missing_connections(my_node_id, core_id, 4);
+                    
+                    // Call your authentic timer logic method!
+                    if raft_state.tick() {
+                        match raft_state.role {
+                            Role::Follower | Role::Candidate => {
+                                println!("[Core {}] Election timeout breached! Starting election for Term {}", core_id, raft_state.current_term + 1);
+                                
+                                // Trigger your custom election state transitions
+                                let vote_req = raft_state.start_election();
+                                
+                                // Pack the structural layout into a raw wire byte buffer
+                                let mut payload_buf = [0u8; 32];
+                                let size = vote_req.to_bytes(&mut payload_buf);
+            
+                                // Broadcast the byte stream across our network mesh array
+                                for peer_id in 0..4 {
+                                    if peer_id == my_node_id { continue; }
+                                    raft_network.send_packet(peer_id, message::TYPE_REQ_VOTE, &payload_buf[1..size]);
+                                }
+                            }
+                            Role::Leader => {
+                                // We are the cluster leader! A tripped timer means it is time for a heartbeat
+                                let heartbeat = raft_state.create_heartbeat();
+                                
+                                let mut payload_buf = [0u8; 32];
+                                let size = heartbeat.to_bytes(&mut payload_buf);
+            
+                                for peer_id in 0..4 {
+                                    if peer_id == my_node_id { continue; }
+                                    raft_network.send_packet(peer_id, message::TYPE_APP_ENTRIES, &payload_buf[1..size]);
+                                }
+                            }
+                        }
+                    }
+                }
 
         
                 for i in 0..epoll_count {
@@ -303,13 +408,31 @@ fn main() -> Result<(), std::io::Error> {
                                                     continue; // Connection successfully pushed out. Stop processing locally!
                                                 }
                                                 
-                                                // --- 2. LOCAL DATABASE FUNCTIONALITY (IT BELONGS TO US!) ---
-                                                // The routing check passed! Now we parse and execute the database operation.
+
                                                 let response_string = match cmd_type {
-                                                    "SET" => {
-                                                        let value = parts.next().unwrap_or("");
-                                                        local_kv_store.insert(key.to_string(), value.to_string());
-                                                        "+OK\r\n".to_string()
+                                                    "SET" | "DELETE" => {
+                                                        // Safety Rule: Only commit modifications if we are the cluster leader
+                                                        if raft_state.role == Role::Leader {
+                                                            if cmd_type == "SET" {
+                                                                let value = parts.next().unwrap_or("");
+                                                                local_kv_store.insert(key.to_string(), value.to_string());
+                                                                "+OK\r\n".to_string()
+                                                            } else {
+                                                                if local_kv_store.remove(key).is_some() {
+                                                                    "+OK\r\n".to_string()
+                                                                } else {
+                                                                    "-ERR KEY_NOT_FOUND\r\n".to_string()
+                                                                }
+                                                            }
+                                                        } else {
+                                                            // Redirection Track: Give client app a redirection error
+                                                            match raft_state.leader_id {
+                                                                Some(leader_node_idx) => {
+                                                                    format!("-ERR MOVED TO NODE {}\r\n", leader_node_idx)
+                                                                }
+                                                                None => "-ERR LEADER_UNAVAILABLE_TRY_AGAIN\r\n".to_string(),
+                                                            }
+                                                        }
                                                     }
                                                     "GET" => {
                                                         match local_kv_store.get(key) {
@@ -317,17 +440,10 @@ fn main() -> Result<(), std::io::Error> {
                                                             None => "-ERR KEY_NOT_FOUND\r\n".to_string(),
                                                         }
                                                     }
-                                                    "DELETE" => {
-                                                        if local_kv_store.remove(key).is_some() {
-                                                            "+OK\r\n".to_string()
-                                                        } else {
-                                                            "-ERR KEY_NOT_FOUND\r\n".to_string()
-                                                        }
-                                                    }
                                                     _ => "-ERR UNKNOWN_COMMAND\r\n".to_string(),
                                                 };
-                                    
-                                                // --- 3. TRANSITION TO OUTBOUND: Clear input and stage the database response ---
+
+
                                                 con.input_buffer.clear(); // We fully processed the input command!
                                                 con.output_buffer.extend_from_slice(response_string.as_bytes()); // Stage response bytes
                                             }
@@ -402,6 +518,106 @@ fn main() -> Result<(), std::io::Error> {
                                 println!("[Core {}] Successfully adopted connection fd: {}", core_id, adopted_fd);
                             }
                         }
+                        // Place this right under the closing brace of ConnType::Doorbell }
+                        ConnType::RaftServer => {
+                            // FIX: Access the underlying Raft listener object inside your raft_network struct!
+                            let Ok((peer_stream, _)) = raft_network._listener.accept() else { continue; };
+                            
+                            if let Err(e) = peer_stream.set_nonblocking(true) {
+                                eprintln!("[Core {}] Failed to set peer stream nonblocking: {}", core_id, e);
+                                continue;
+                            }
+                            
+                            let peer_fd = peer_stream.as_raw_fd();
+
+                            let peer_event = EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, peer_fd as u64);
+                            if let Err(e) = epoll.add(&peer_stream, peer_event) {
+                                eprintln!("[Core {}] Failed to add peer stream to epoll: {}", core_id, e);
+                                continue;
+                            }
+
+                            let peer_conn = Conn {
+                                fd: peer_fd,
+                                stream: Some(peer_stream),
+                                input_buffer: Vec::new(),
+                                output_buffer: Vec::new(),
+                                conn_type: ConnType::RaftPeer,
+                            };
+                            connections.insert(peer_fd, peer_conn);
+                            println!("[Core {}] Accepted incoming peer consensus line connection.", core_id);
+                        }
+
+
+                        ConnType::RaftPeer => {
+                               if let Some(ref mut peer_stream) = con.stream {
+                                   // Read raw wire byte arrays out of our non-blocking peer cable channel
+                                   if let Some((msg_type, payload)) = raft_network.receive_packet(peer_stream) {
+                                       
+                                       // Reconstruct the 1 byte header prefix into your type allocations
+                                       let mut wire_buffer = vec![msg_type];
+                                       wire_buffer.extend_from_slice(&payload);
+                           
+                                       match msg_type {
+                                           // CASE 1: AN OUTSIDE NODE IS REQUESTING OUR VOTE
+                                           message::TYPE_REQ_VOTE => {
+                                               let req = RequestVote::from_bytes(&wire_buffer);
+                                               let vote_response = raft_state.handle_request_vote(&req);
+                                               
+                                               let mut resp_buf = [0u8; 32];
+                                               let size = vote_response.to_bytes(&mut resp_buf);
+                                               raft_network.send_packet(req.candidate_id, message::TYPE_VOTE_RESP, &resp_buf[1..size]);
+                                           }
+                           
+                                           // CASE 2: A NODE REPLIED TO OUR ELECTION CALL
+                                           message::TYPE_VOTE_RESP => {
+                                               let resp = VoteResponse::from_bytes(&wire_buffer);
+                                               
+                                               // Pass the response to your state machine. We look for a majority of 4 nodes!
+                                               let won_election = raft_state.handle_vote_response(&resp, 4);
+                                               
+                                               if won_election {
+                                                   println!("[Core {}] Majority Quorum secured! I am now the active LEADER.", core_id);
+                                                   
+                                                   // Send an immediate authority asserting heartbeat down the network grid
+                                                   let heartbeat = raft_state.create_heartbeat();
+                                                   let mut hb_buf = [0u8; 32];
+                                                   let size = heartbeat.to_bytes(&mut hb_buf);
+                                                   
+                                                   for peer_id in 0..4 {
+                                                       if peer_id == my_node_id { continue; }
+                                                       raft_network.send_packet(peer_id, message::TYPE_APP_ENTRIES, &hb_buf[1..size]);
+                                                   }
+                                               }
+                                           }
+                           
+                                            message::TYPE_APP_ENTRIES => {
+                                                let hb_req = AppendEntries::from_bytes(&wire_buffer);
+                                                let ack_response = raft_state.handle_append_entries(&hb_req);
+                                                
+                                                let mut ack_buf = [0u8; 32];
+                                                let size = ack_response.to_bytes(&mut ack_buf);
+                                                raft_network.send_packet(hb_req.leader_id, message::TYPE_APP_RESP, &ack_buf[1..size]);
+                                            }
+ 
+                                                                                       // CASE 4: FOLLOWER ACKNOWLEDGED OUR HEARTBEAT PULSE
+                                            message::TYPE_APP_RESP => {
+                                                // Convert wire buffer bytes back into our response struct frame
+                                                let resp = AppendEntriesResponse::from_bytes(&wire_buffer);
+                                                
+                                                if resp.success {
+                                                    // Quiet verification trace showing this follower node is synced up
+                                                    println!("[Core {}] Follower Node {} confirmed active heartbeat sync alignment.", core_id, resp.follower_id);
+                                                } else {
+                                                    // Term mismatch or partition recovery indicator trace
+                                                    println!("[Core {}] Follower Node {} rejected heartbeat. Term out of sync.", core_id, resp.follower_id);
+                                                }
+                                            }
+                           
+                                           _ => {}
+                                       }
+                                   }
+                               }
+                        }                           
 
 
                     }
