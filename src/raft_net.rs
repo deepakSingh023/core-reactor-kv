@@ -87,12 +87,48 @@ impl CoreRaftNetwork {
                 let msg_type = header_buf[0];
                 
                 let expected_payload_size = match msg_type {
-                    TYPE_REQ_VOTE => 16,   // term (8b) + candidate_id (8b)
-                    TYPE_VOTE_RESP => 9,   // term (8b) + vote_granted (1b)
-                    TYPE_APP_ENTRIES => 16, // term (8b) + leader_id (8b)
-                    TYPE_APP_RESP => 9,    // term (8b) + success (1b)
+                    TYPE_REQ_VOTE => 16,   // term (8b) + candidate_id (8b) = 16
+                    
+                    // ✨ FIX 1: Change from 9 to 17! term (8b) + voter_id (8b) + granted (1b) = 17
+                    TYPE_VOTE_RESP => 17,  
+                    
+                    TYPE_APP_ENTRIES => 16, // term (8b) + leader_id (8b) = 16
+                    
+                    // ✨ FIX 2: Change from 9 to 17! term (8b) + follower_id (8b) + success (1b) = 17
+                    TYPE_APP_RESP => 17,   
+                    
+                    5 => {
+                        // 1. Read the next 3 structural bytes directly (is_delete, key_len, val_len)
+                        let mut data_header = [0u8; 3];
+                        match stream.read_exact(&mut data_header) {
+                            Ok(()) => {
+                                let key_size = data_header[1] as usize;
+                                let val_size = data_header[2] as usize;
+                                let remaining_payload_size = key_size + val_size;
+                    
+                                // 2. Read the remaining string payloads
+                                let mut body_buf = vec![0u8; remaining_payload_size];
+                                match stream.read_exact(&mut body_buf) {
+                                    Ok(()) => {
+                                        // 3. Assemble a uniform buffer that matches what `from_bytes` expects:
+                                        // [msg_type (omitted since from_bytes starts at index 1), is_delete, key_len, val_len, payload...]
+                                        let mut full_payload = Vec::with_capacity(3 + remaining_payload_size);
+                                        full_payload.extend_from_slice(&data_header);
+                                        full_payload.extend_from_slice(&body_buf);
+                                        
+                                        // Return it. Note: receive_packet returns Option<(u8, Vec<u8>)>
+                                        return Some((msg_type, full_payload));
+                                    }
+                                    Err(_) => return None,
+                                }
+                            }
+                            Err(_) => return None,
+                        }
+                    }
+                    6 => 9, 
                     _ => return None,
                 };
+
 
                 let mut payload_buf = vec![0u8; expected_payload_size];
                 match stream.read_exact(&mut payload_buf) {

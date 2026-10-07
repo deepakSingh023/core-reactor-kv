@@ -8,6 +8,7 @@ use nix::sys::epoll::{
     EpollEvent,
     EpollFlags,
 };
+
 mod election;
 use sharding::calculate_shard;
 use inter_core::InterCoreMessage;
@@ -43,9 +44,7 @@ struct Conn {
 struct CoreLocalReactor {
     connections: HashMap<i32, Conn>,
 }
-pub mod raft_proto {
-    tonic::include_proto!("raft");
-}
+
 fn main() -> Result<(), std::io::Error> {
 
     // Collect command line arguments: cargo run -- <node_id>
@@ -411,30 +410,44 @@ fn main() -> Result<(), std::io::Error> {
 
                                                 let response_string = match cmd_type {
                                                     "SET" | "DELETE" => {
-                                                        // Safety Rule: Only commit modifications if we are the cluster leader
                                                         if raft_state.role == Role::Leader {
-                                                            if cmd_type == "SET" {
-                                                                let value = parts.next().unwrap_or("");
+                                                            let is_delete = cmd_type == "DELETE";
+                                                            let value = parts.next().unwrap_or("");
+
+                                                            // 1. Package your structural replication data payload
+                                                            let sync_msg = message::ReplicateData {
+                                                                is_delete,
+                                                                key: key.to_string(),
+                                                                value: value.to_string(),
+                                                            };
+
+                                                            let mut wire_buf = [0u8; 128];
+                                                            let payload_size = sync_msg.to_bytes(&mut wire_buf);
+
+                                                            // 2. Broadcast vertically to the exact same core index across all other nodes
+                                                            for peer_node_id in 0..4 {
+                                                                if peer_node_id == my_node_id { continue; }
+                                                                // Skip byte index 0 (Type Header) as send_packet appends its own
+                                                                raft_network.send_packet(peer_node_id, message::TYPE_REPLICATE_DATA, &wire_buf[1..payload_size]);
+                                                            }
+
+                                                            // 3. Complete mutation locally on this initial machine node core
+                                                            if is_delete {
+                                                                if local_kv_store.remove(key).is_some() { "+OK\r\n".to_string() } else { "-ERR KEY_NOT_FOUND\r\n".to_string() }
+                                                            } else {
                                                                 local_kv_store.insert(key.to_string(), value.to_string());
                                                                 "+OK\r\n".to_string()
-                                                            } else {
-                                                                if local_kv_store.remove(key).is_some() {
-                                                                    "+OK\r\n".to_string()
-                                                                } else {
-                                                                    "-ERR KEY_NOT_FOUND\r\n".to_string()
-                                                                }
                                                             }
                                                         } else {
-                                                            // Redirection Track: Give client app a redirection error
+                                                            // Follower rejection track
                                                             match raft_state.leader_id {
-                                                                Some(leader_node_idx) => {
-                                                                    format!("-ERR MOVED TO NODE {}\r\n", leader_node_idx)
-                                                                }
+                                                                Some(leader_id) => format!("-ERR MOVED TO NODE {}\r\n", leader_id),
                                                                 None => "-ERR LEADER_UNAVAILABLE_TRY_AGAIN\r\n".to_string(),
                                                             }
                                                         }
                                                     }
                                                     "GET" => {
+                                                        // Blazing fast local read since data is fully replicated across all matching levels!
                                                         match local_kv_store.get(key) {
                                                             Some(val) => format!("+{}\r\n", val),
                                                             None => "-ERR KEY_NOT_FOUND\r\n".to_string(),
@@ -496,15 +509,13 @@ fn main() -> Result<(), std::io::Error> {
         
                         }
                         ConnType::Doorbell => {
-
                             let mut ack_buf = [0u8; 8];
                             unsafe {
                                 nix::libc::read(fd2, ack_buf.as_mut_ptr() as *mut std::ffi::c_void, 8);
                             }
-                        
 
                             while let Ok(parcel) = core_channels.receiver.try_recv() {
-                                let adopted_fd = parcel.client_fd; // Fix field name from parcel.fd to parcel.client_fd
+                                let adopted_fd = parcel.client_fd;
                                 let mut adopted_conn = parcel.conn;
                                 
                                 adopted_conn.conn_type = ConnType::Client;
@@ -513,12 +524,63 @@ fn main() -> Result<(), std::io::Error> {
                                     let adopted_event = EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, adopted_fd as u64);
                                     epoll.add(stream, adopted_event).expect("Failed to register adopted client stream");
                                 }
-                        
+
+                                if !adopted_conn.input_buffer.is_empty() && adopted_conn.input_buffer.contains(&b'\n') {
+                                    if let Ok(payload_str) = std::str::from_utf8(&adopted_conn.input_buffer) {
+                                        let clean_command = payload_str.trim();
+                                        let mut parts = clean_command.split_whitespace();
+                                        let cmd_type = parts.next().unwrap_or("");
+                                        let key = parts.next().unwrap_or("");
+
+                                        let response_string = match cmd_type {
+                                            "SET" | "DELETE" => {
+                                                if raft_state.role == Role::Leader {
+                                                    if cmd_type == "SET" {
+                                                        let value = parts.next().unwrap_or("");
+                                                        local_kv_store.insert(key.to_string(), value.to_string());
+                                                        "+OK\r\n".to_string()
+                                                    } else {
+                                                        if local_kv_store.remove(key).is_some() { "+OK\r\n".to_string() } else { "-ERR KEY_NOT_FOUND\r\n".to_string() }
+                                                    }
+                                                } else {
+                                                    match raft_state.leader_id {
+                                                        Some(leader_node_idx) => format!("-ERR MOVED TO NODE {}\r\n", leader_node_idx),
+                                                        None => "-ERR LEADER_UNAVAILABLE_TRY_AGAIN\r\n".to_string(),
+                                                    }
+                                                }
+                                            }
+                                            "GET" => {
+                                                match local_kv_store.get(key) {
+                                                    Some(val) => format!("+{}\r\n", val),
+                                                    None => "-ERR KEY_NOT_FOUND\r\n".to_string(),
+                                                }
+                                            }
+                                            _ => "-ERR UNKNOWN_COMMAND\r\n".to_string(),
+                                        };
+
+                                        // Clear the input space and stage the database response bytes
+                                        adopted_conn.input_buffer.clear();
+                                        adopted_conn.output_buffer.extend_from_slice(response_string.as_bytes());
+                                    }
+                                }
+
+                                // Securely insert into our connections map registry
                                 connections.insert(adopted_fd as i32, adopted_conn);
-                                println!("[Core {}] Successfully adopted connection fd: {}", core_id, adopted_fd);
+                                println!("[Core {}] Successfully adopted and flushed SPSC descriptor pipeline for fd: {}", core_id, adopted_fd);
+
+                                // If an output response was generated during immediate adoption, write it out instantly
+                                if let Some(con_ref) = connections.get_mut(&(adopted_fd as i32)) {
+                                    if !con_ref.output_buffer.is_empty() {
+                                        if let Some(ref mut stream) = con_ref.stream {
+                                            let _ = stream.write_all(&con_ref.output_buffer);
+                                            con_ref.output_buffer.clear();
+                                        }
+                                    }
+                                }
                             }
                         }
-                        // Place this right under the closing brace of ConnType::Doorbell }
+
+
                         ConnType::RaftServer => {
                             // FIX: Access the underlying Raft listener object inside your raft_network struct!
                             let Ok((peer_stream, _)) = raft_network._listener.accept() else { continue; };
@@ -575,7 +637,7 @@ fn main() -> Result<(), std::io::Error> {
                                                // Pass the response to your state machine. We look for a majority of 4 nodes!
                                                let won_election = raft_state.handle_vote_response(&resp, 4);
                                                
-                                               if won_election {
+                                               if won_election && raft_state.votes_received.len() >= 3  {
                                                    println!("[Core {}] Majority Quorum secured! I am now the active LEADER.", core_id);
                                                    
                                                    // Send an immediate authority asserting heartbeat down the network grid
@@ -612,6 +674,39 @@ fn main() -> Result<(), std::io::Error> {
                                                     println!("[Core {}] Follower Node {} rejected heartbeat. Term out of sync.", core_id, resp.follower_id);
                                                 }
                                             }
+                                            message::TYPE_REPLICATE_DATA => {
+                                                // Reconstruct the wire buffer: position 0 is type header, followed by the payload
+                                                let mut wire_buffer = vec![msg_type];
+                                                wire_buffer.extend_from_slice(&payload);
+                                            
+                                                // Now from_bytes will index perfectly: buf[1]=is_delete, buf[2]=key_len, etc.
+                                                let incoming_data = message::ReplicateData::from_bytes(&wire_buffer);
+                                                
+                                                if incoming_data.is_delete {
+                                                    local_kv_store.remove(&incoming_data.key);
+                                                    println!("[Core {}] Synced DELETE execution frame for key: '{}'", core_id, incoming_data.key);
+                                                } else {
+                                                    local_kv_store.insert(incoming_data.key.clone(), incoming_data.value.clone());
+                                                    println!("[Core {}] Replicated and saved data frame successfully: '{}' -> '{}'", core_id, incoming_data.key, incoming_data.value);
+                                                }
+                                            
+                                                // Respond back with a small acknowledgment frame
+                                                let mut ack_buf = [0u8; 9];
+                                                ack_buf[0] = message::TYPE_REPLICATE_ACK;
+                                                ack_buf[1..9].copy_from_slice(&raft_state.current_term.to_be_bytes());
+                                                raft_network.send_packet(raft_state.leader_id.unwrap_or(0), message::TYPE_REPLICATE_ACK, &ack_buf[1..9]);
+                                            }
+
+
+
+                                            message::TYPE_REPLICATE_ACK => {
+                                                // Extract the follower's term from the wire buffer safely
+                                                let follower_term = u64::from_be_bytes(wire_buffer[1..9].try_into().unwrap());
+                                                println!("[Core {}] Intercepted replication acknowledgment wire frame for Term {}.", core_id, follower_term);
+                                            }
+
+
+
                            
                                            _ => {}
                                        }
