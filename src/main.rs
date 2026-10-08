@@ -533,22 +533,43 @@ fn main() -> Result<(), std::io::Error> {
                                         let key = parts.next().unwrap_or("");
 
                                         let response_string = match cmd_type {
-                                            "SET" | "DELETE" => {
-                                                if raft_state.role == Role::Leader {
-                                                    if cmd_type == "SET" {
-                                                        let value = parts.next().unwrap_or("");
-                                                        local_kv_store.insert(key.to_string(), value.to_string());
-                                                        "+OK\r\n".to_string()
-                                                    } else {
-                                                        if local_kv_store.remove(key).is_some() { "+OK\r\n".to_string() } else { "-ERR KEY_NOT_FOUND\r\n".to_string() }
+                                                    "SET" | "DELETE" => {
+                                                        if raft_state.role == Role::Leader {
+                                                            let is_delete = cmd_type == "DELETE";
+                                                            let value = parts.next().unwrap_or("");
+
+                                                            // 1. Package your structural replication data payload
+                                                            let sync_msg = message::ReplicateData {
+                                                                is_delete,
+                                                                key: key.to_string(),
+                                                                value: value.to_string(),
+                                                            };
+
+                                                            let mut wire_buf = [0u8; 128];
+                                                            let payload_size = sync_msg.to_bytes(&mut wire_buf);
+
+                                                            // 2. Broadcast vertically to the exact same core index across all other nodes
+                                                            for peer_node_id in 0..4 {
+                                                                if peer_node_id == my_node_id { continue; }
+                                                                // Skip byte index 0 (Type Header) as send_packet appends its own
+                                                                raft_network.send_packet(peer_node_id, message::TYPE_REPLICATE_DATA, &wire_buf[1..payload_size]);
+                                                            }
+
+                                                            // 3. Complete mutation locally on this initial machine node core
+                                                            if is_delete {
+                                                                if local_kv_store.remove(key).is_some() { "+OK\r\n".to_string() } else { "-ERR KEY_NOT_FOUND\r\n".to_string() }
+                                                            } else {
+                                                                local_kv_store.insert(key.to_string(), value.to_string());
+                                                                "+OK\r\n".to_string()
+                                                            }
+                                                        } else {
+                                                            // Follower rejection track
+                                                            match raft_state.leader_id {
+                                                                Some(leader_id) => format!("-ERR MOVED TO NODE {}\r\n", leader_id),
+                                                                None => "-ERR LEADER_UNAVAILABLE_TRY_AGAIN\r\n".to_string(),
+                                                            }
+                                                        }
                                                     }
-                                                } else {
-                                                    match raft_state.leader_id {
-                                                        Some(leader_node_idx) => format!("-ERR MOVED TO NODE {}\r\n", leader_node_idx),
-                                                        None => "-ERR LEADER_UNAVAILABLE_TRY_AGAIN\r\n".to_string(),
-                                                    }
-                                                }
-                                            }
                                             "GET" => {
                                                 match local_kv_store.get(key) {
                                                     Some(val) => format!("+{}\r\n", val),
