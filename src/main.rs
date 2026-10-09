@@ -8,7 +8,9 @@ use nix::sys::epoll::{
     EpollEvent,
     EpollFlags,
 };
-
+use prost::bytes::TryGetError;
+use std::time::{Duration, Instant};
+use std::collections::VecDeque;
 mod election;
 use sharding::calculate_shard;
 use inter_core::InterCoreMessage;
@@ -21,6 +23,8 @@ use crossbeam_channel::{unbounded, Sender, Receiver};
 
 use state::{RaftState, Role};
 use message::{RequestVote, VoteResponse, AppendEntries, AppendEntriesResponse};
+
+use crate::ConnType::Client;
 mod raft_net;
 // In main.rs
 #[derive(Debug)]
@@ -45,6 +49,26 @@ struct CoreLocalReactor {
     connections: HashMap<i32, Conn>,
 }
 
+struct PendingWrite {
+    key: String,
+    value: String,
+    is_delete: bool,
+    client_fd: RawFd,
+    acked: [bool; 4],      // index = node_id
+    started_at: Instant,
+}
+
+fn reply_to_client(connections: &mut HashMap<RawFd, Conn>, fd: RawFd, msg: &str) {
+    if let Some(con) = connections.get_mut(&fd) {
+        con.output_buffer.extend_from_slice(msg.as_bytes());
+        if let Some(ref mut stream) = con.stream {
+            if let Ok(n) = stream.write(&con.output_buffer) {
+                con.output_buffer.drain(0..n);
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), std::io::Error> {
 
     // Collect command line arguments: cargo run -- <node_id>
@@ -54,8 +78,6 @@ fn main() -> Result<(), std::io::Error> {
     } else {
         0 // Fallback default to Node 0 if no argument passed
     };
-
-    let total_cores = 4;
 
 
     // Number of cores/threads used by the reactor.
@@ -223,6 +245,8 @@ fn main() -> Result<(), std::io::Error> {
                     return;
                 }
             }
+
+            let mut timeout_queue: VecDeque<u64> = VecDeque::new();
             
             // Map it into our connections map using our new ConnType tag variant
             let raft_server_conn = Conn {
@@ -233,7 +257,11 @@ fn main() -> Result<(), std::io::Error> {
                 conn_type: ConnType::RaftServer, // <--- Tells epoll: "This is a peer node knocking"
             };
             connections.insert(raft_network.listener_fd, raft_server_conn);
-            
+
+            //We define the pending ledger and the id
+            let mut pending: HashMap<u64, PendingWrite> = HashMap::new();
+            let mut next_id: u64 = 0;
+            let mut to_reply: Vec<RawFd> = Vec::new();
             
         
             let mut events = [EpollEvent::empty(); 64];
@@ -253,6 +281,18 @@ fn main() -> Result<(), std::io::Error> {
                         continue;
                     }
                 };
+
+                while let Some(&oldest_id) = timeout_queue.front() {
+                    match pending.get(&oldest_id) {
+                        None => { timeout_queue.pop_front(); }
+                        Some(w) if w.started_at.elapsed() > Duration::from_secs(2) => {
+                            let w = pending.remove(&oldest_id).unwrap();
+                            reply_to_client(&mut connections, w.client_fd, "-ERR TIMEOUT\r\n");
+                            timeout_queue.pop_front();
+                        }
+                        Some(_) => break,
+                    }
+                }
 
 
 
@@ -424,20 +464,39 @@ fn main() -> Result<(), std::io::Error> {
                                                             let mut wire_buf = [0u8; 128];
                                                             let payload_size = sync_msg.to_bytes(&mut wire_buf);
 
+                                                            let mut acked = [false; 4];
+                                                            acked[my_node_id as usize] = true;   // leader counts itself
+                                                            
+                                                            let id = next_id; next_id += 1;
+                                                            
+                                                            let pending_data = PendingWrite {
+                                                                key: key.to_string(), value: value.to_string(),
+                                                                is_delete,                        // the variable, not false
+                                                                client_fd: fd2, acked, started_at: Instant::now(),
+                                                            };
+                                                            pending.insert(id, pending_data);
+                                                            timeout_queue.push_back(id);
+
+                                                            let mut payload = id.to_be_bytes().to_vec();
+                                                             payload.extend_from_slice(&wire_buf[1..payload_size]);
+
                                                             // 2. Broadcast vertically to the exact same core index across all other nodes
                                                             for peer_node_id in 0..4 {
                                                                 if peer_node_id == my_node_id { continue; }
-                                                                // Skip byte index 0 (Type Header) as send_packet appends its own
-                                                                raft_network.send_packet(peer_node_id, message::TYPE_REPLICATE_DATA, &wire_buf[1..payload_size]);
+                                                                raft_network.send_packet(peer_node_id, message::TYPE_REPLICATE_DATA, &payload);
                                                             }
 
-                                                            // 3. Complete mutation locally on this initial machine node core
-                                                            if is_delete {
-                                                                if local_kv_store.remove(key).is_some() { "+OK\r\n".to_string() } else { "-ERR KEY_NOT_FOUND\r\n".to_string() }
-                                                            } else {
-                                                                local_kv_store.insert(key.to_string(), value.to_string());
-                                                                "+OK\r\n".to_string()
-                                                            }
+
+                                                            //3. Complete mutation locally on this initial machine node core
+                                                            // if is_delete {
+                                                            //    if local_kv_store.remove(key).is_some() { "+OK\r\n".to_string() } else { "-ERR KEY_NOT_FOUND\r\n".to_string() }
+                                                            // } else {
+                                                            //    local_kv_store.insert(key.to_string(), value.to_string());
+                                                            //     "+OK\r\n".to_string()
+                                                            // }
+
+
+                                                            String::new() 
                                                         } else {
                                                             // Follower rejection track
                                                             match raft_state.leader_id {
@@ -548,20 +607,32 @@ fn main() -> Result<(), std::io::Error> {
                                                             let mut wire_buf = [0u8; 128];
                                                             let payload_size = sync_msg.to_bytes(&mut wire_buf);
 
+
+                                                            let mut acked = [false; 4];
+                                                            acked[my_node_id as usize] = true;   // leader counts itself
+                                                            
+                                                            let id = next_id; next_id += 1;
+                                                            
+                                                            let pending_data = PendingWrite {
+                                                                key: key.to_string(), value: value.to_string(),
+                                                                is_delete,                        // the variable, not false
+                                                                client_fd: fd2, acked, started_at: Instant::now(),
+                                                            };
+                                                            pending.insert(id, pending_data);
+                                                            timeout_queue.push_back(id);
+
+                                                            let mut payload = id.to_be_bytes().to_vec();
+                                                             payload.extend_from_slice(&wire_buf[1..payload_size]);
+
                                                             // 2. Broadcast vertically to the exact same core index across all other nodes
                                                             for peer_node_id in 0..4 {
                                                                 if peer_node_id == my_node_id { continue; }
                                                                 // Skip byte index 0 (Type Header) as send_packet appends its own
-                                                                raft_network.send_packet(peer_node_id, message::TYPE_REPLICATE_DATA, &wire_buf[1..payload_size]);
+                                                                raft_network.send_packet(peer_node_id, message::TYPE_REPLICATE_DATA, &payload);
                                                             }
 
-                                                            // 3. Complete mutation locally on this initial machine node core
-                                                            if is_delete {
-                                                                if local_kv_store.remove(key).is_some() { "+OK\r\n".to_string() } else { "-ERR KEY_NOT_FOUND\r\n".to_string() }
-                                                            } else {
-                                                                local_kv_store.insert(key.to_string(), value.to_string());
-                                                                "+OK\r\n".to_string()
-                                                            }
+                                                            String::new()
+
                                                         } else {
                                                             // Follower rejection track
                                                             match raft_state.leader_id {
@@ -634,7 +705,7 @@ fn main() -> Result<(), std::io::Error> {
                         ConnType::RaftPeer => {
                                if let Some(ref mut peer_stream) = con.stream {
                                    // Read raw wire byte arrays out of our non-blocking peer cable channel
-                                   if let Some((msg_type, payload)) = raft_network.receive_packet(peer_stream) {
+                                   while let Some((msg_type, payload)) = raft_network.receive_packet(peer_stream) {
                                        
                                        // Reconstruct the 1 byte header prefix into your type allocations
                                        let mut wire_buffer = vec![msg_type];
@@ -696,34 +767,45 @@ fn main() -> Result<(), std::io::Error> {
                                                 }
                                             }
                                             message::TYPE_REPLICATE_DATA => {
-                                                // Reconstruct the wire buffer: position 0 is type header, followed by the payload
-                                                let mut wire_buffer = vec![msg_type];
-                                                wire_buffer.extend_from_slice(&payload);
+                                                let id = u64::from_be_bytes(payload[0..8].try_into().unwrap());
                                             
-                                                // Now from_bytes will index perfectly: buf[1]=is_delete, buf[2]=key_len, etc.
-                                                let incoming_data = message::ReplicateData::from_bytes(&wire_buffer);
-                                                
+                                                let mut data_buffer = vec![msg_type];
+                                                data_buffer.extend_from_slice(&payload[8..]);      // skip the id
+                                                let incoming_data = message::ReplicateData::from_bytes(&data_buffer);
+                                            
                                                 if incoming_data.is_delete {
                                                     local_kv_store.remove(&incoming_data.key);
-                                                    println!("[Core {}] Synced DELETE execution frame for key: '{}'", core_id, incoming_data.key);
                                                 } else {
                                                     local_kv_store.insert(incoming_data.key.clone(), incoming_data.value.clone());
-                                                    println!("[Core {}] Replicated and saved data frame successfully: '{}' -> '{}'", core_id, incoming_data.key, incoming_data.value);
                                                 }
                                             
-                                                // Respond back with a small acknowledgment frame
-                                                let mut ack_buf = [0u8; 9];
-                                                ack_buf[0] = message::TYPE_REPLICATE_ACK;
-                                                ack_buf[1..9].copy_from_slice(&raft_state.current_term.to_be_bytes());
-                                                raft_network.send_packet(raft_state.leader_id.unwrap_or(0), message::TYPE_REPLICATE_ACK, &ack_buf[1..9]);
+                                                if let Some(leader) = raft_state.leader_id {
+                                                    let mut ack = [0u8; 16];
+                                                    ack[0..8].copy_from_slice(&id.to_be_bytes());
+                                                    ack[8..16].copy_from_slice(&my_node_id.to_be_bytes());
+                                                    raft_network.send_packet(leader, message::TYPE_REPLICATE_ACK, &ack);
+                                                }
                                             }
 
 
-
                                             message::TYPE_REPLICATE_ACK => {
-                                                // Extract the follower's term from the wire buffer safely
-                                                let follower_term = u64::from_be_bytes(wire_buffer[1..9].try_into().unwrap());
-                                                println!("[Core {}] Intercepted replication acknowledgment wire frame for Term {}.", core_id, follower_term);
+                                                let id = u64::from_be_bytes(payload[0..8].try_into().unwrap());
+                                                let from = u64::from_be_bytes(payload[8..16].try_into().unwrap()) as usize;
+                                            
+                                                if from < 4 {
+                                                    if let Some(w) = pending.get_mut(&id) {
+                                                        w.acked[from] = true;
+                                                        if w.acked.iter().filter(|&&a| a).count() >= 3 {
+                                                            let w = pending.remove(&id).unwrap();
+                                                            if w.is_delete {
+                                                                local_kv_store.remove(&w.key);
+                                                            } else {
+                                                                local_kv_store.insert(w.key, w.value);
+                                                            }
+                                                            to_reply.push(w.client_fd);
+                                                        }
+                                                    }
+                                                }
                                             }
 
 
@@ -738,6 +820,10 @@ fn main() -> Result<(), std::io::Error> {
 
                     }
         
+                }
+
+                for fd in to_reply.drain(..) {
+                    reply_to_client(&mut connections, fd, "+OK\r\n");
                 }
             }
 

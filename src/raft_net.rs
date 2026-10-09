@@ -68,14 +68,10 @@ impl CoreRaftNetwork {
 
     pub fn send_packet(&mut self, target_node_id: u64, msg_type: u8, payload: &[u8]) {
         if let Some(stream) = self.peer_connections.get_mut(&target_node_id) {
-            let mut wire_buffer = [0u8; 32];
-            wire_buffer[0] = msg_type; // Inject Type ID byte at position 0
-            
-            let data_length = payload.len();
-            wire_buffer[1..1 + data_length].copy_from_slice(payload);
-            
-            let total_bytes = 1 + data_length;
-            let _ = stream.write_all(&wire_buffer[0..total_bytes]);
+            let mut wire = Vec::with_capacity(1 + payload.len());
+            wire.push(msg_type);
+            wire.extend_from_slice(payload);
+            let _ = stream.write_all(&wire);
         }
     }
 
@@ -98,34 +94,28 @@ impl CoreRaftNetwork {
                     TYPE_APP_RESP => 17,   
                     
                     5 => {
-                        // 1. Read the next 3 structural bytes directly (is_delete, key_len, val_len)
-                        let mut data_header = [0u8; 3];
-                        match stream.read_exact(&mut data_header) {
-                            Ok(()) => {
-                                let key_size = data_header[1] as usize;
-                                let val_size = data_header[2] as usize;
-                                let remaining_payload_size = key_size + val_size;
+                        // 1. Read the 8-byte id first
+                        let mut id_buf = [0u8; 8];
+                        if stream.read_exact(&mut id_buf).is_err() { return None; }
                     
-                                // 2. Read the remaining string payloads
-                                let mut body_buf = vec![0u8; remaining_payload_size];
-                                match stream.read_exact(&mut body_buf) {
-                                    Ok(()) => {
-                                        // 3. Assemble a uniform buffer that matches what `from_bytes` expects:
-                                        // [msg_type (omitted since from_bytes starts at index 1), is_delete, key_len, val_len, payload...]
-                                        let mut full_payload = Vec::with_capacity(3 + remaining_payload_size);
-                                        full_payload.extend_from_slice(&data_header);
-                                        full_payload.extend_from_slice(&body_buf);
-                                        
-                                        // Return it. Note: receive_packet returns Option<(u8, Vec<u8>)>
-                                        return Some((msg_type, full_payload));
-                                    }
-                                    Err(_) => return None,
-                                }
-                            }
-                            Err(_) => return None,
-                        }
+                        // 2. Then the 3 header bytes: is_delete, key_len, val_len
+                        let mut data_header = [0u8; 3];
+                        if stream.read_exact(&mut data_header).is_err() { return None; }
+                        let key_size = data_header[1] as usize;
+                        let val_size = data_header[2] as usize;
+                    
+                        // 3. Then the key and value bytes
+                        let mut body_buf = vec![0u8; key_size + val_size];
+                        if stream.read_exact(&mut body_buf).is_err() { return None; }
+                    
+                        // 4. Return id + header + body, in that order
+                        let mut full_payload = Vec::with_capacity(8 + 3 + key_size + val_size);
+                        full_payload.extend_from_slice(&id_buf);
+                        full_payload.extend_from_slice(&data_header);
+                        full_payload.extend_from_slice(&body_buf);
+                        return Some((msg_type, full_payload));
                     }
-                    6 => 9, 
+                    6 => 16, 
                     _ => return None,
                 };
 
