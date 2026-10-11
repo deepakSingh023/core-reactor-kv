@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use nix::sys::epoll::{
     Epoll,
@@ -8,7 +7,6 @@ use nix::sys::epoll::{
     EpollEvent,
     EpollFlags,
 };
-use prost::bytes::TryGetError;
 use std::time::{Duration, Instant};
 use std::collections::VecDeque;
 mod election;
@@ -19,56 +17,23 @@ mod state;      // Points directly to your src/state.rs file
 mod message;    // Points directly to your src/message.rs file
 mod sharding;
 mod inter_core;
-use crossbeam_channel::{unbounded, Sender, Receiver};
-
+mod types;
 use state::{RaftState, Role};
 use message::{RequestVote, VoteResponse, AppendEntries, AppendEntriesResponse};
-
-use crate::ConnType::Client;
 mod raft_net;
-// In main.rs
-#[derive(Debug)]
-enum ConnType {
-    Listener,
-    Client, 
-    Doorbell,
-    RaftServer, // Listens for new incoming peer network dials
-    RaftPeer,   // An active data channel link with a peer node core
-}
-
-
-#[derive(Debug)]
-struct Conn {
-    fd: RawFd,
-    stream: Option<TcpStream>, 
-    input_buffer: Vec<u8>,
-    output_buffer: Vec<u8>,
-    conn_type: ConnType, 
-}
-struct CoreLocalReactor {
-    connections: HashMap<i32, Conn>,
-}
-
-struct PendingWrite {
-    key: String,
-    value: String,
-    is_delete: bool,
-    client_fd: RawFd,
-    acked: [bool; 4],      // index = node_id
-    started_at: Instant,
-}
-
+use types::{Conn, ConnType , PendingWrite};
+mod conn_io;
+use conn_io::{read_available,flush_output};
+mod command;
+use command::execute_command;
 fn reply_to_client(connections: &mut HashMap<RawFd, Conn>, fd: RawFd, msg: &str) {
     if let Some(con) = connections.get_mut(&fd) {
         con.output_buffer.extend_from_slice(msg.as_bytes());
-        if let Some(ref mut stream) = con.stream {
-            if let Ok(n) = stream.write(&con.output_buffer) {
-                con.output_buffer.drain(0..n);
-            }
+        if !flush_output(con) {
+            connections.remove(&fd);      // broken connection: drop it
         }
     }
 }
-
 fn main() -> Result<(), std::io::Error> {
 
     // Collect command line arguments: cargo run -- <node_id>
@@ -385,188 +350,59 @@ fn main() -> Result<(), std::io::Error> {
                         ConnType::Client=>{
         
                             if events[i].events().contains(EpollFlags::EPOLLIN){
+
+                                let mut disconnected = !read_available(con);
         
-                                if let Some(ref mut stream) = con.stream{
-                                    let mut disconnected = false;
-        
-                                    loop {
-        
-                                        let mut scratch_buf = [0u8; 4096];
-        
-                                        match stream.read(&mut scratch_buf){
-        
-                                            Ok(0) =>{
-                                                println!("no data here to read");
-                                                disconnected = true;
-                                                break;
-                                            }
-                                            Ok(bytes_read) =>{
-                                                //appends to the input buffer by taking bytes from the buffer , also only count bytes present with help of 0..bytes_read
-                                                con.input_buffer.extend_from_slice(&scratch_buf[0..bytes_read]);
-                                                println!("Appended {} bytes to input_buffer.", bytes_read);
-                                                if bytes_read < 4096 {
-                                                    break;
+                                if !disconnected && !con.input_buffer.is_empty() {
+                                    if con.input_buffer.contains(&b'\n') {
+                                        if let Ok(payload_str) = std::str::from_utf8(&con.input_buffer) {
+                                            let clean_command = payload_str.trim();
+                                            
+                                            // --- 1. ROUTING DECISION: Extract the key to check ownership ---
+                                            // If the command is "SET score 100", the key is "score"
+                                            let mut parts = clean_command.split_whitespace();
+                                            let cmd_type = parts.next().unwrap_or("");
+                                            let key = parts.next().unwrap_or("");
+                                            
+                                            let assigned_core = calculate_shard(key);
+                                            
+                                            if assigned_core != core_id {
+                                                // IT DOES NOT BELONG TO US: Forward the whole Conn struct away immediately!
+                                                println!("[Core {}] Mismatch! Forwarding connection to Core {}", core_id, assigned_core);
+                                                if let Some(ref stream) = con.stream { let _ = epoll.delete(stream); }
+                                                if let Some(removed_conn) = connections.remove(&fd2) {
+                                                    let parcel = InterCoreMessage { client_fd: fd2, conn: removed_conn };
+                                                    let _ = core_channels.senders[assigned_core].try_send(parcel);
+                                                    let _ = unsafe { nix::libc::write(core_channels.peer_eventfds[assigned_core], 1u64.to_ne_bytes().as_ptr() as *const _, 8) };
                                                 }
+                                                continue; // Connection successfully pushed out. Stop processing locally!
                                             }
-        
-                                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                                break; // Drained the kernel buffer
-                                            }
-                                            Err(e) => {
-                                                println!("Read error on fd {}: {}", con.fd, e);
-                                                disconnected = true;
-                                                break;
-                                            }
-        
-                                        }
-        
-                                    }
-        
-                                    if !disconnected && !con.input_buffer.is_empty() {
-                                        if con.input_buffer.contains(&b'\n') {
-                                            if let Ok(payload_str) = std::str::from_utf8(&con.input_buffer) {
-                                                let clean_command = payload_str.trim();
-                                                
-                                                // --- 1. ROUTING DECISION: Extract the key to check ownership ---
-                                                // If the command is "SET score 100", the key is "score"
-                                                let mut parts = clean_command.split_whitespace();
-                                                let cmd_type = parts.next().unwrap_or("");
-                                                let key = parts.next().unwrap_or("");
-                                                
-                                                let assigned_core = calculate_shard(key);
-                                                
-                                                if assigned_core != core_id {
-                                                    // IT DOES NOT BELONG TO US: Forward the whole Conn struct away immediately!
-                                                    println!("[Core {}] Mismatch! Forwarding connection to Core {}", core_id, assigned_core);
-                                                    if let Some(ref stream) = con.stream { let _ = epoll.delete(stream); }
-                                                    if let Some(removed_conn) = connections.remove(&fd2) {
-                                                        let parcel = InterCoreMessage { client_fd: fd2, conn: removed_conn };
-                                                        let _ = core_channels.senders[assigned_core].try_send(parcel);
-                                                        let _ = unsafe { nix::libc::write(core_channels.peer_eventfds[assigned_core], 1u64.to_ne_bytes().as_ptr() as *const _, 8) };
-                                                    }
-                                                    continue; // Connection successfully pushed out. Stop processing locally!
-                                                }
-                                                
-
-                                                let response_string = match cmd_type {
-                                                    "SET" | "DELETE" => {
-                                                        if raft_state.role == Role::Leader {
-                                                            let is_delete = cmd_type == "DELETE";
-                                                            let value = parts.next().unwrap_or("");
-
-                                                            // 1. Package your structural replication data payload
-                                                            let sync_msg = message::ReplicateData {
-                                                                is_delete,
-                                                                key: key.to_string(),
-                                                                value: value.to_string(),
-                                                            };
-
-                                                            let mut wire_buf = [0u8; 128];
-                                                            let payload_size = sync_msg.to_bytes(&mut wire_buf);
-
-                                                            let mut acked = [false; 4];
-                                                            acked[my_node_id as usize] = true;   // leader counts itself
-                                                            
-                                                            let id = next_id; next_id += 1;
-                                                            
-                                                            let pending_data = PendingWrite {
-                                                                key: key.to_string(), value: value.to_string(),
-                                                                is_delete,                        // the variable, not false
-                                                                client_fd: fd2, acked, started_at: Instant::now(),
-                                                            };
-                                                            pending.insert(id, pending_data);
-                                                            timeout_queue.push_back(id);
-
-                                                            let mut payload = id.to_be_bytes().to_vec();
-                                                             payload.extend_from_slice(&wire_buf[1..payload_size]);
-
-                                                            // 2. Broadcast vertically to the exact same core index across all other nodes
-                                                            for peer_node_id in 0..4 {
-                                                                if peer_node_id == my_node_id { continue; }
-                                                                raft_network.send_packet(peer_node_id, message::TYPE_REPLICATE_DATA, &payload);
-                                                            }
-
-
-                                                            //3. Complete mutation locally on this initial machine node core
-                                                            // if is_delete {
-                                                            //    if local_kv_store.remove(key).is_some() { "+OK\r\n".to_string() } else { "-ERR KEY_NOT_FOUND\r\n".to_string() }
-                                                            // } else {
-                                                            //    local_kv_store.insert(key.to_string(), value.to_string());
-                                                            //     "+OK\r\n".to_string()
-                                                            // }
-
-
-                                                            String::new() 
-                                                        } else {
-                                                            // Follower rejection track
-                                                            match raft_state.leader_id {
-                                                                Some(leader_id) => format!("-ERR MOVED TO NODE {}\r\n", leader_id),
-                                                                None => "-ERR LEADER_UNAVAILABLE_TRY_AGAIN\r\n".to_string(),
-                                                            }
-                                                        }
-                                                    }
-                                                    "GET" => {
-                                                        // Blazing fast local read since data is fully replicated across all matching levels!
-                                                        match local_kv_store.get(key) {
-                                                            Some(val) => format!("+{}\r\n", val),
-                                                            None => "-ERR KEY_NOT_FOUND\r\n".to_string(),
-                                                        }
-                                                    }
-                                                    _ => "-ERR UNKNOWN_COMMAND\r\n".to_string(),
-                                                };
-
-
-                                                con.input_buffer.clear(); // We fully processed the input command!
-                                                con.output_buffer.extend_from_slice(response_string.as_bytes()); // Stage response bytes
-                                            }
+                                            
+                                            let value = parts.next().unwrap_or("");
+                                            let response_string = execute_command(
+                                                cmd_type, key, value, fd2,            // in the Doorbell arm use adopted_fd instead of fd2
+                                                &raft_state, &local_kv_store, &mut raft_network,
+                                                &mut pending, &mut timeout_queue, &mut next_id, my_node_id,
+                                            );
+                                            con.input_buffer.clear(); // We fully processed the input command!
+                                            con.output_buffer.extend_from_slice(response_string.as_bytes()); // Stage response bytes
                                         }
                                     }
+                                }
 
-                                    if !disconnected && !con.output_buffer.is_empty() {
-                                        if let Some(ref mut stream) = con.stream {
-                                            loop {
-                                                // Try to write the whole remaining output buffer
-                                                match stream.write(&con.output_buffer) {
-                                                    Ok(0) => {
-                                                        // Kernel write buffer is broken or socket dropped
-                                                        disconnected = true;
-                                                        break;
-                                                    }
-                                                    Ok(bytes_written) => {
-                                                        println!("Sent {} bytes back to client.", bytes_written);
-                                                        // Remove the sent bytes from the front of the queue
-                                                        con.output_buffer.drain(0..bytes_written);
-                                                        
-                                                        // If everything is sent, we are done!
-                                                        if con.output_buffer.is_empty() {
-                                                            break;
-                                                        }
-                                                    }
-                                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                                        // Kernel write buffer is completely full. 
-                                                        // Stop writing, keep the remaining data in output_buffer, and yield back to epoll!
-                                                        break;
-                                                    }
-                                                    Err(e) => {
-                                                        println!("Write error on fd {}: {}", con.fd, e);
-                                                        disconnected = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                if !disconnected && !con.output_buffer.is_empty() {
+                                    disconnected = !flush_output(con);
+                                }
                                 
-                                    if disconnected {
-                                        connections.remove(&fd2); 
-        
-                                    }
-        
+                                if disconnected {
+                                    connections.remove(&fd2); 
                                 }
         
                             }
         
                         }
+        
+                        
                         ConnType::Doorbell => {
                             let mut ack_buf = [0u8; 8];
                             unsafe {
@@ -590,65 +426,12 @@ fn main() -> Result<(), std::io::Error> {
                                         let mut parts = clean_command.split_whitespace();
                                         let cmd_type = parts.next().unwrap_or("");
                                         let key = parts.next().unwrap_or("");
-
-                                        let response_string = match cmd_type {
-                                                    "SET" | "DELETE" => {
-                                                        if raft_state.role == Role::Leader {
-                                                            let is_delete = cmd_type == "DELETE";
-                                                            let value = parts.next().unwrap_or("");
-
-                                                            // 1. Package your structural replication data payload
-                                                            let sync_msg = message::ReplicateData {
-                                                                is_delete,
-                                                                key: key.to_string(),
-                                                                value: value.to_string(),
-                                                            };
-
-                                                            let mut wire_buf = [0u8; 128];
-                                                            let payload_size = sync_msg.to_bytes(&mut wire_buf);
-
-
-                                                            let mut acked = [false; 4];
-                                                            acked[my_node_id as usize] = true;   // leader counts itself
-                                                            
-                                                            let id = next_id; next_id += 1;
-                                                            
-                                                            let pending_data = PendingWrite {
-                                                                key: key.to_string(), value: value.to_string(),
-                                                                is_delete,                        // the variable, not false
-                                                                client_fd: fd2, acked, started_at: Instant::now(),
-                                                            };
-                                                            pending.insert(id, pending_data);
-                                                            timeout_queue.push_back(id);
-
-                                                            let mut payload = id.to_be_bytes().to_vec();
-                                                             payload.extend_from_slice(&wire_buf[1..payload_size]);
-
-                                                            // 2. Broadcast vertically to the exact same core index across all other nodes
-                                                            for peer_node_id in 0..4 {
-                                                                if peer_node_id == my_node_id { continue; }
-                                                                // Skip byte index 0 (Type Header) as send_packet appends its own
-                                                                raft_network.send_packet(peer_node_id, message::TYPE_REPLICATE_DATA, &payload);
-                                                            }
-
-                                                            String::new()
-
-                                                        } else {
-                                                            // Follower rejection track
-                                                            match raft_state.leader_id {
-                                                                Some(leader_id) => format!("-ERR MOVED TO NODE {}\r\n", leader_id),
-                                                                None => "-ERR LEADER_UNAVAILABLE_TRY_AGAIN\r\n".to_string(),
-                                                            }
-                                                        }
-                                                    }
-                                            "GET" => {
-                                                match local_kv_store.get(key) {
-                                                    Some(val) => format!("+{}\r\n", val),
-                                                    None => "-ERR KEY_NOT_FOUND\r\n".to_string(),
-                                                }
-                                            }
-                                            _ => "-ERR UNKNOWN_COMMAND\r\n".to_string(),
-                                        };
+                                        let value = parts.next().unwrap_or("");
+                                        let response_string = execute_command(
+                                            cmd_type, key, value, fd2,            // in the Doorbell arm use adopted_fd instead of fd2
+                                            &raft_state, &local_kv_store, &mut raft_network,
+                                            &mut pending, &mut timeout_queue, &mut next_id, my_node_id,
+                                        );
 
                                         // Clear the input space and stage the database response bytes
                                         adopted_conn.input_buffer.clear();
@@ -787,7 +570,6 @@ fn main() -> Result<(), std::io::Error> {
                                                 }
                                             }
 
-
                                             message::TYPE_REPLICATE_ACK => {
                                                 let id = u64::from_be_bytes(payload[0..8].try_into().unwrap());
                                                 let from = u64::from_be_bytes(payload[8..16].try_into().unwrap()) as usize;
@@ -808,9 +590,6 @@ fn main() -> Result<(), std::io::Error> {
                                                 }
                                             }
 
-
-
-                           
                                            _ => {}
                                        }
                                    }

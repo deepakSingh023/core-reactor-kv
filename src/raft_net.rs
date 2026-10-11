@@ -37,6 +37,7 @@ impl CoreRaftNetwork {
         ).unwrap();
 
         let address: std::net::SocketAddr = format!("127.0.0.1:{}", my_raft_port).parse().unwrap();
+        socket.set_reuse_address(true).unwrap();
         socket.bind(&socket2::SockAddr::from(address)).unwrap();
         socket.listen(128).unwrap();
         socket.set_nonblocking(true).unwrap(); // Must be non-blocking for our epoll engine
