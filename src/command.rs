@@ -1,12 +1,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
 use std::time::Instant;
-
+use std::time::Duration;
+use crate::conn_io::reply_to_client;
 use crate::message;
 use crate::raft_net::CoreRaftNetwork;
 use crate::state::{RaftState, Role};
 use crate::types::PendingWrite;
-
+use crate::Conn;
 pub fn execute_command(
     cmd: &str, key: &str, value: &str, client_fd: RawFd,
     raft_state: &RaftState,
@@ -58,5 +59,25 @@ pub fn execute_command(
             None => "-ERR KEY_NOT_FOUND\r\n".to_string(),
         },
         _ => "-ERR UNKNOWN_COMMAND\r\n".to_string(),
+    }
+}
+
+/// Answers `-ERR TIMEOUT` to clients whose write never reached a majority.
+/// The queue is in creation order, so only its front can expire first.
+pub fn expire_pending_writes(
+    connections: &mut HashMap<RawFd, Conn>,
+    pending: &mut HashMap<u64, PendingWrite>,
+    timeout_queue: &mut VecDeque<u64>,
+) {
+    while let Some(&oldest_id) = timeout_queue.front() {
+        match pending.get(&oldest_id) {
+            None => { timeout_queue.pop_front(); }            // already committed
+            Some(w) if w.started_at.elapsed() > Duration::from_secs(2) => {
+                let w = pending.remove(&oldest_id).unwrap();
+                reply_to_client(connections, w.client_fd, "-ERR TIMEOUT\r\n");
+                timeout_queue.pop_front();
+            }
+            Some(_) => break,                                 // oldest is fresh, so all newer ones are too
+        }
     }
 }

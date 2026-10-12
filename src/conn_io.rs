@@ -1,10 +1,11 @@
 use std::io::{ErrorKind, Read, Write};
-use libc::posix_spawnattr_t;
-
-use crate::types::Conn;
+use crate::types::{Conn, ConnType};
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::net::{TcpListener,TcpStream};
+use nix::sys::epoll::{Epoll, EpollEvent, EpollFlags};
+use std::os::fd::{AsRawFd, BorrowedFd};
+
 pub fn read_available(con: &mut Conn) -> bool {
     let Some(stream) = con.stream.as_mut() else { return false; };
     let mut scratch_buf = [0u8; 4096];
@@ -63,7 +64,7 @@ pub fn bind_client_listener(port: u64) -> std::io::Result<TcpListener> {
             // Allow multiple reactor threads to bind the same address.
             socket.set_reuse_port(true)?;
 
-            let current_client_port = 8080 + port; 
+            let current_client_port = port; 
                 let address: std::net::SocketAddr = format!("127.0.0.1:{}", current_client_port)
                    .parse()
                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -81,3 +82,36 @@ pub fn bind_client_listener(port: u64) -> std::io::Result<TcpListener> {
             Ok(listener)
 
  }
+
+ /// Registers an accepted TCP stream (client or peer) in epoll and stores it in the map.
+/// Takes: the epoll, the connection map, the stream, and what kind of connection it is.
+/// Returns: Ok(()) or the error from making it non-blocking / registering it.
+pub fn register_connection(
+    epoll: &Epoll,
+    connections: &mut HashMap<RawFd, Conn>,
+    stream: TcpStream,
+    conn_type: ConnType,
+) -> std::io::Result<()> {
+    stream.set_nonblocking(true)?;
+    let fd = stream.as_raw_fd();
+    epoll
+        .add(&stream, EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, fd as u64))
+        .map_err(std::io::Error::from)?;
+    connections.insert(fd, Conn::new(fd, Some(stream), conn_type));
+    Ok(())
+}
+
+/// Registers an fd that is not a TcpStream (a listener or the doorbell eventfd).
+pub fn register_raw_fd(
+    epoll: &Epoll,
+    connections: &mut HashMap<RawFd, Conn>,
+    fd: RawFd,
+    conn_type: ConnType,
+) -> std::io::Result<()> {
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    epoll
+        .add(borrowed, EpollEvent::new(EpollFlags::EPOLLIN, fd as u64))
+        .map_err(std::io::Error::from)?;
+    connections.insert(fd, Conn::new(fd, None, conn_type));
+    Ok(())
+}

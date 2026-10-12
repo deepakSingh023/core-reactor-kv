@@ -2,7 +2,7 @@
 
 use std::os::fd::RawFd;
 use crossbeam_channel::{Receiver, Sender};
-use crate::Conn;
+use crate::types::Conn;
 /*
 
   THE PROBLEM:
@@ -87,4 +87,37 @@ impl CoreChannels {
         
         received_fds
     }
+}
+
+/// Builds one CoreChannels per core: an inbound queue plus a doorbell eventfd for each core,
+/// and a sender into every queue for each core.
+/// Takes: how many cores. Returns: one CoreChannels per core, in order.
+pub fn build_channel_mesh(total_cores: usize) -> std::io::Result<Vec<CoreChannels>> {
+    let mut senders_mesh: Vec<Vec<Sender<InterCoreMessage>>> = vec![vec![]; total_cores];
+    let mut receivers: Vec<Option<Receiver<InterCoreMessage>>> = (0..total_cores).map(|_| None).collect();
+    let mut eventfds: Vec<RawFd> = Vec::new();
+
+    for core in 0..total_cores {
+        // EFD_NONBLOCK keeps doorbell reads and writes from ever stalling a thread.
+        let efd = unsafe { nix::libc::eventfd(0, nix::libc::EFD_NONBLOCK) };
+        if efd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        eventfds.push(efd);
+
+        let (sender, receiver) = crossbeam_channel::unbounded::<InterCoreMessage>();
+        receivers[core] = Some(receiver);
+        for source in 0..total_cores {
+            senders_mesh[source].push(sender.clone());
+        }
+    }
+
+    Ok((0..total_cores)
+        .map(|core| CoreChannels {
+            senders: senders_mesh[core].clone(),
+            receiver: receivers[core].take().unwrap(),
+            my_eventfd: eventfds[core],
+            peer_eventfds: eventfds.clone(),
+        })
+        .collect())
 }

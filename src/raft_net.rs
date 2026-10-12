@@ -1,14 +1,9 @@
-// src/raft_net.rs
 
 use std::net::{TcpListener,TcpStream};
 use std::collections::HashMap;
 use std::os::fd::{RawFd,AsRawFd};
 use socket2;
-use super::message::{AppendEntries, AppendEntriesResponse, RequestVote, VoteResponse};
-use super::state::{RaftState, Role};
 use std::io::{Read, Write};
-
-// Bring in our packet type identifiers
 const TYPE_REQ_VOTE: u8 = 1;
 const TYPE_VOTE_RESP: u8 = 2;
 const TYPE_APP_ENTRIES: u8 = 3;
@@ -86,12 +81,10 @@ impl CoreRaftNetwork {
                 let expected_payload_size = match msg_type {
                     TYPE_REQ_VOTE => 16,   // term (8b) + candidate_id (8b) = 16
                     
-                    // ✨ FIX 1: Change from 9 to 17! term (8b) + voter_id (8b) + granted (1b) = 17
                     TYPE_VOTE_RESP => 17,  
                     
                     TYPE_APP_ENTRIES => 16, // term (8b) + leader_id (8b) = 16
                     
-                    // ✨ FIX 2: Change from 9 to 17! term (8b) + follower_id (8b) + success (1b) = 17
                     TYPE_APP_RESP => 17,   
                     
                     5 => {
@@ -119,7 +112,6 @@ impl CoreRaftNetwork {
                     6 => 16, 
                     _ => return None,
                 };
-
 
                 let mut payload_buf = vec![0u8; expected_payload_size];
                 match stream.read_exact(&mut payload_buf) {

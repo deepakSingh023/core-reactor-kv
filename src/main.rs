@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use nix::sys::epoll::{
     Epoll,
@@ -7,25 +6,23 @@ use nix::sys::epoll::{
     EpollEvent,
     EpollFlags,
 };
-use std::time::{Duration, Instant};
 use std::collections::VecDeque;
 mod election;
 use sharding::calculate_shard;
 use inter_core::InterCoreMessage;
 mod state;      // Points directly to your src/state.rs file
-      // Points directly to your src/raft.rs file
+
 mod message;    // Points directly to your src/message.rs file
 mod sharding;
 mod inter_core;
 mod types;
-use state::{RaftState, Role};
-use message::{RequestVote, VoteResponse, AppendEntries, AppendEntriesResponse};
+use state::{RaftState};
 mod raft_net;
 use types::{Conn, ConnType , PendingWrite };
 mod conn_io;
-use conn_io::{read_available,flush_output,reply_to_client,bind_client_listener};
+use conn_io::{read_available,flush_output,reply_to_client,bind_client_listener,register_connection,register_raw_fd};
 mod command;
-use command::execute_command;
+use command::{execute_command , expire_pending_writes};
 mod peer;
 use peer::{handle_peer_message,tick_raft};
 
@@ -41,7 +38,6 @@ fn main() -> Result<(), std::io::Error> {
 
     // Number of cores/threads used by the reactor.
     let total_cores = 4;
-
     
     let mut senders_mesh: Vec<Vec<crossbeam_channel::Sender<InterCoreMessage>>> = vec![vec![]; total_cores];
     let mut receivers_mesh: Vec<Option<crossbeam_channel::Receiver<InterCoreMessage>>> = vec![None; total_cores];
@@ -70,7 +66,6 @@ fn main() -> Result<(), std::io::Error> {
     let mut thread_handles = vec![];
 
     // Store thread handles so the main thread can join them.    
-
     for core_id in 0..total_cores{
 
         // --- EXTRACT CORE TOOLS BEFORE SPAWNING THE THREAD ---
@@ -93,7 +88,6 @@ fn main() -> Result<(), std::io::Error> {
  
             // Get available CPU cores to pin reactor threads.
             let core_ids = core_affinity::get_core_ids().unwrap();
-
 
             if let Some(target_core) = core_ids.get(core_id) {
                 core_affinity::set_for_current(*target_core);
@@ -121,51 +115,20 @@ fn main() -> Result<(), std::io::Error> {
                     eprintln!("[Core {}] Failed to create epoll: {}", core_id, e);
                     return;
                 }
-            };        
-            let event = EpollEvent::new(
-                EpollFlags::EPOLLIN,
-                listener.as_raw_fd() as u64,
-            );
-             
-            //Adding the fd of the listener to the epoll
-            if let Err(e) = epoll.add(&listener, event) {
-                eprintln!("[Core {}] Failed to add listener to epoll: {}", core_id, e);
-                return;
-            }
+            }; 
 
-            let conn = Conn::new(listener.as_raw_fd(), None, ConnType::Listener);
-        
-            connections.insert(listener.as_raw_fd() as i32,conn);
-
-            // --- REGISTER YOUR DOORBELL INTO THE EPOLL INSTANCE ---
-            let doorbell_event = EpollEvent::new(EpollFlags::EPOLLIN, my_eventfd as u64);
-            unsafe {
-                // Borrow the raw file descriptor safely so epoll can trace it
-                let borrowed_efd = std::os::fd::BorrowedFd::borrow_raw(my_eventfd);
-                if let Err(e) = epoll.add(&borrowed_efd, doorbell_event) {
-                    eprintln!("[Core {}] Failed to add eventfd to epoll: {}", core_id, e);
+            for (fd, kind) in [
+                (listener.as_raw_fd(), ConnType::Listener),
+                (core_channels.my_eventfd, ConnType::Doorbell),
+                (raft_network.listener_fd, ConnType::RaftServer),
+            ] {
+                if let Err(e) = register_raw_fd(&epoll, &mut connections, fd, kind) {
+                    eprintln!("[Core {}] Failed to register fd {}: {}", core_id, fd, e);
                     return;
                 }
             }
             
-            // Map the doorbell into our connections directory so epoll_wait can identify it
-            let doorbell_conn = Conn::new(my_eventfd, None, ConnType::Doorbell);
-            connections.insert(my_eventfd, doorbell_conn);
-
-            // --- REGISTER YOUR PRIVATE CONSENSUS SERVER PORT INTO THE SAME EPOLL ENGINE ---
-            let raft_server_event = EpollEvent::new(EpollFlags::EPOLLIN, raft_network.listener_fd as u64);
-            unsafe {
-                let borrowed_raft_fd = std::os::fd::BorrowedFd::borrow_raw(raft_network.listener_fd);
-                if let Err(e) = epoll.add(&borrowed_raft_fd, raft_server_event) {
-                    eprintln!("[Core {}] Failed to add Raft server fd to epoll: {}", core_id, e);
-                    return;
-                }
-            }
-
             let mut timeout_queue: VecDeque<u64> = VecDeque::new();
-            
-            let raft_server_conn = Conn::new(raft_network.listener_fd, None, ConnType::RaftServer);
-            connections.insert(raft_network.listener_fd, raft_server_conn);
 
             //We define the pending ledger and the id
             let mut pending: HashMap<u64, PendingWrite> = HashMap::new();
@@ -190,17 +153,8 @@ fn main() -> Result<(), std::io::Error> {
                     }
                 };
 
-                while let Some(&oldest_id) = timeout_queue.front() {
-                    match pending.get(&oldest_id) {
-                        None => { timeout_queue.pop_front(); }
-                        Some(w) if w.started_at.elapsed() > Duration::from_secs(2) => {
-                            let w = pending.remove(&oldest_id).unwrap();
-                            reply_to_client(&mut connections, w.client_fd, "-ERR TIMEOUT\r\n");
-                            timeout_queue.pop_front();
-                        }
-                        Some(_) => break,
-                    }
-                }
+                //timout   queue logic to return time out error
+                expire_pending_writes(&mut connections, &mut pending, &mut timeout_queue);
 
                 if epoll_count == 0 {
                     raft_network.retry_missing_connections(my_node_id, core_id, 4);
@@ -217,36 +171,10 @@ fn main() -> Result<(), std::io::Error> {
                     match con.conn_type{
                         ConnType::Listener=>{
         
-                            // Keep it flat, but skip if there's nothing to read right now
-                            let Ok((stream, addr)) = listener.accept() else { continue; };
-    
-                            if let Err(e) = stream.set_nonblocking(true) {
-                                eprintln!(
-                                    "[Core {}] Failed to make client nonblocking: {}",
-                                    core_id,
-                                    e
-                                );
-                                continue;
+                            let Ok((stream, _)) = listener.accept() else { continue; };
+                            if let Err(e) = register_connection(&epoll, &mut connections, stream, ConnType::Client) {
+                                eprintln!("[Core {}] Failed to register client: {}", core_id, e);
                             }
-        
-                            let client_fd = stream.as_raw_fd() as u64;
-        
-                             let event2 = EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET,client_fd);
-                             
-                             if let Err(e) = epoll.add(&stream, event2) {
-                                 eprintln!(
-                                     "[Core {}] Failed to add client fd {} to epoll: {}",
-                                     core_id,
-                                     client_fd,
-                                     e
-                                 );
-                                 continue;
-                             }
-
-                            let conn2 = Conn::new(client_fd as i32, Some(stream), ConnType::Client);
-        
-                            connections.insert(client_fd as i32, conn2);
-        
                         }
                         ConnType::Client=>{
         
@@ -272,9 +200,7 @@ fn main() -> Result<(), std::io::Error> {
                                                 println!("[Core {}] Mismatch! Forwarding connection to Core {}", core_id, assigned_core);
                                                 if let Some(ref stream) = con.stream { let _ = epoll.delete(stream); }
                                                 if let Some(removed_conn) = connections.remove(&fd2) {
-                                                    let parcel = InterCoreMessage { client_fd: fd2, conn: removed_conn };
-                                                    let _ = core_channels.senders[assigned_core].try_send(parcel);
-                                                    let _ = unsafe { nix::libc::write(core_channels.peer_eventfds[assigned_core], 1u64.to_ne_bytes().as_ptr() as *const _, 8) };
+                                                    core_channels.forward_to_core(assigned_core, fd2, removed_conn);
                                                 }
                                                 continue; // Connection successfully pushed out. Stop processing locally!
                                             }
@@ -302,7 +228,6 @@ fn main() -> Result<(), std::io::Error> {
                             }
         
                         }
-        
                         
                         ConnType::Doorbell => {
                             let mut ack_buf = [0u8; 8];
@@ -318,7 +243,10 @@ fn main() -> Result<(), std::io::Error> {
                         
                                 if let Some(ref stream) = adopted_conn.stream {
                                     let adopted_event = EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, adopted_fd as u64);
-                                    epoll.add(stream, adopted_event).expect("Failed to register adopted client stream");
+                                    if let Err(e) = epoll.add(stream, adopted_event) {
+                                        eprintln!("[Core {}] Failed to adopt fd {}: {}", core_id, adopted_fd, e);
+                                        continue;
+                                    }
                                 }
 
                                 if !adopted_conn.input_buffer.is_empty() && adopted_conn.input_buffer.contains(&b'\n') {
@@ -341,41 +269,18 @@ fn main() -> Result<(), std::io::Error> {
                                     }
                                 }
 
-                                // Securely insert into our connections map registry
-                                connections.insert(adopted_fd as i32, adopted_conn);
-                                println!("[Core {}] Successfully adopted and flushed SPSC descriptor pipeline for fd: {}", core_id, adopted_fd);
-
-                                // If an output response was generated during immediate adoption, write it out instantly
-                                if let Some(con_ref) = connections.get_mut(&(adopted_fd as i32)) {
-                                    if !con_ref.output_buffer.is_empty() {
-                                        if let Some(ref mut stream) = con_ref.stream {
-                                            let _ = stream.write_all(&con_ref.output_buffer);
-                                            con_ref.output_buffer.clear();
-                                        }
-                                    }
-                                }
+                                flush_output(&mut adopted_conn);
+                                connections.insert(adopted_fd, adopted_conn);
                             }
                         }
 
                         ConnType::RaftServer => {
                             // FIX: Access the underlying Raft listener object inside your raft_network struct!
                             let Ok((peer_stream, _)) = raft_network._listener.accept() else { continue; };
-                            
-                            if let Err(e) = peer_stream.set_nonblocking(true) {
-                                eprintln!("[Core {}] Failed to set peer stream nonblocking: {}", core_id, e);
-                                continue;
+                            if let Err(e) = register_connection(&epoll, &mut connections, peer_stream, ConnType::RaftPeer) {
+                                eprintln!("[Core {}] Failed to register peer: {}", core_id, e);
                             }
                             
-                            let peer_fd = peer_stream.as_raw_fd();
-
-                            let peer_event = EpollEvent::new(EpollFlags::EPOLLIN | EpollFlags::EPOLLET, peer_fd as u64);
-                            if let Err(e) = epoll.add(&peer_stream, peer_event) {
-                                eprintln!("[Core {}] Failed to add peer stream to epoll: {}", core_id, e);
-                                continue;
-                            }
-
-                            let peer_conn = Conn::new(peer_fd, Some(peer_stream), ConnType::RaftPeer);
-                            connections.insert(peer_fd, peer_conn);
                             println!("[Core {}] Accepted incoming peer consensus line connection.", core_id);
                         }
 
