@@ -21,22 +21,14 @@ mod types;
 use state::{RaftState, Role};
 use message::{RequestVote, VoteResponse, AppendEntries, AppendEntriesResponse};
 mod raft_net;
-use types::{Conn, ConnType , PendingWrite};
+use types::{Conn, ConnType , PendingWrite };
 mod conn_io;
-use conn_io::{read_available,flush_output};
+use conn_io::{read_available,flush_output,reply_to_client,bind_client_listener};
 mod command;
 use command::execute_command;
 mod peer;
-
 use peer::{handle_peer_message,tick_raft};
-fn reply_to_client(connections: &mut HashMap<RawFd, Conn>, fd: RawFd, msg: &str) {
-    if let Some(con) = connections.get_mut(&fd) {
-        con.output_buffer.extend_from_slice(msg.as_bytes());
-        if !flush_output(con) {
-            connections.remove(&fd);      // broken connection: drop it
-        }
-    }
-}
+
 fn main() -> Result<(), std::io::Error> {
 
     // Collect command line arguments: cargo run -- <node_id>
@@ -46,7 +38,6 @@ fn main() -> Result<(), std::io::Error> {
     } else {
         0 // Fallback default to Node 0 if no argument passed
     };
-
 
     // Number of cores/threads used by the reactor.
     let total_cores = 4;
@@ -100,7 +91,6 @@ fn main() -> Result<(), std::io::Error> {
         // Spawn one reactor thread for this core.
         let handle = std::thread::spawn(move || {
  
-
             // Get available CPU cores to pin reactor threads.
             let core_ids = core_affinity::get_core_ids().unwrap();
 
@@ -114,45 +104,15 @@ fn main() -> Result<(), std::io::Error> {
 
             let mut local_kv_store: HashMap<String,String> = HashMap::new();
 
-            let mut raft_state = RaftState {
-                node_id: my_node_id,
-                current_term: 0,
-                voted_for: None,
-                role: Role::Follower,
-                leader_id: None,
-                votes_received: std::collections::HashSet::new(),
-                election_elapsed: 0,
-                // Every core shard gets a unique timeout window to ensure one node wins clearly
-                election_timeout: 15 + (core_id as u64 * 5), 
-                heartbeat_elapsed: 0,
-                heartbeat_interval: 3, // Leaders pulse a heartbeat every 3 ticks (300ms)
-            };
-
-
+            let mut raft_state = RaftState::new(my_node_id, core_id);
 
             // A single call boots up the whole sharded Raft network stack for this thread!
             let mut raft_network = raft_net::CoreRaftNetwork::new(my_node_id, core_id, 4);
 
-
-            //Instead of blindly opening a listener it goes into linux kernel and get a raw unconfigured network file descriptor
-            let socket = socket2::Socket::new(socket2::Domain::IPV4,socket2::Type::STREAM, Some(socket2::Protocol::TCP)).unwrap();
-            
-            // Allow multiple reactor threads to bind the same address.
-            socket.set_reuse_port(true).unwrap();
-
-       
-            let current_client_port = 8080 + my_node_id; 
-            let address : std::net::SocketAddr = format!("127.0.0.1:{}", current_client_port).parse().unwrap();
-            
-            socket.bind(&socket2::SockAddr::from(address)).unwrap();
-
-            socket.listen(128).unwrap();
-
-            //It makes the listener non blocking
-            socket.set_nonblocking(true).unwrap();
-
-            // Convert the configured socket into a TcpListener.            
-            let listener: std::net::TcpListener = socket.into();
+            let listener = match bind_client_listener(8080 + my_node_id) {
+                Ok(l) => l,
+                Err(e) => { eprintln!("[Core {}] Failed to bind client listener: {}", core_id, e); return; }
+            };
         
             //Creating new epoll
             let epoll: Epoll = match Epoll::new(EpollCreateFlags::empty()) {
@@ -172,14 +132,8 @@ fn main() -> Result<(), std::io::Error> {
                 eprintln!("[Core {}] Failed to add listener to epoll: {}", core_id, e);
                 return;
             }
-        
-            let conn = Conn{
-                fd:listener.as_raw_fd(),
-                stream:None,
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                conn_type:ConnType::Listener,
-            };
+
+            let conn = Conn::new(listener.as_raw_fd(), None, ConnType::Listener);
         
             connections.insert(listener.as_raw_fd() as i32,conn);
 
@@ -195,13 +149,7 @@ fn main() -> Result<(), std::io::Error> {
             }
             
             // Map the doorbell into our connections directory so epoll_wait can identify it
-            let doorbell_conn = Conn {
-                fd: my_eventfd,
-                stream: None,
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                conn_type: ConnType::Doorbell,
-            };
+            let doorbell_conn = Conn::new(my_eventfd, None, ConnType::Doorbell);
             connections.insert(my_eventfd, doorbell_conn);
 
             // --- REGISTER YOUR PRIVATE CONSENSUS SERVER PORT INTO THE SAME EPOLL ENGINE ---
@@ -216,14 +164,7 @@ fn main() -> Result<(), std::io::Error> {
 
             let mut timeout_queue: VecDeque<u64> = VecDeque::new();
             
-            // Map it into our connections map using our new ConnType tag variant
-            let raft_server_conn = Conn {
-                fd: raft_network.listener_fd,
-                stream: None,
-                input_buffer: Vec::new(),
-                output_buffer: Vec::new(),
-                conn_type: ConnType::RaftServer, // <--- Tells epoll: "This is a peer node knocking"
-            };
+            let raft_server_conn = Conn::new(raft_network.listener_fd, None, ConnType::RaftServer);
             connections.insert(raft_network.listener_fd, raft_server_conn);
 
             //We define the pending ledger and the id
@@ -236,7 +177,6 @@ fn main() -> Result<(), std::io::Error> {
         
             loop {
                 
-      
                 let timeout = nix::sys::epoll::EpollTimeout::try_from(100).unwrap();
 
                 let epoll_count = match epoll.wait(
@@ -262,16 +202,12 @@ fn main() -> Result<(), std::io::Error> {
                     }
                 }
 
-
-
-
                 if epoll_count == 0 {
                     raft_network.retry_missing_connections(my_node_id, core_id, 4);
 
                     tick_raft(&mut raft_state,  &mut raft_network, core_id, my_node_id);
                 }
 
-        
                 for i in 0..epoll_count {
         
                     let fd = events[i].data();
@@ -306,14 +242,8 @@ fn main() -> Result<(), std::io::Error> {
                                  );
                                  continue;
                              }
-                            
-                            let conn2 = Conn{
-                                fd:client_fd as i32,
-                                stream:Some(stream),
-                                input_buffer: Vec::new(),
-                                output_buffer:Vec::new(),
-                                conn_type: ConnType::Client
-                            };
+
+                            let conn2 = Conn::new(client_fd as i32, Some(stream), ConnType::Client);
         
                             connections.insert(client_fd as i32, conn2);
         
@@ -427,7 +357,6 @@ fn main() -> Result<(), std::io::Error> {
                             }
                         }
 
-
                         ConnType::RaftServer => {
                             // FIX: Access the underlying Raft listener object inside your raft_network struct!
                             let Ok((peer_stream, _)) = raft_network._listener.accept() else { continue; };
@@ -445,17 +374,10 @@ fn main() -> Result<(), std::io::Error> {
                                 continue;
                             }
 
-                            let peer_conn = Conn {
-                                fd: peer_fd,
-                                stream: Some(peer_stream),
-                                input_buffer: Vec::new(),
-                                output_buffer: Vec::new(),
-                                conn_type: ConnType::RaftPeer,
-                            };
+                            let peer_conn = Conn::new(peer_fd, Some(peer_stream), ConnType::RaftPeer);
                             connections.insert(peer_fd, peer_conn);
                             println!("[Core {}] Accepted incoming peer consensus line connection.", core_id);
                         }
-
 
                         ConnType::RaftPeer => {
                                if let Some(ref mut peer_stream) = con.stream {

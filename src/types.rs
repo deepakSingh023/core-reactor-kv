@@ -1,6 +1,8 @@
 use std::os::fd::{AsRawFd, RawFd};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
+
+
 #[derive(Debug)]
 pub struct Conn {
     pub fd: RawFd,
@@ -26,4 +28,16 @@ pub struct PendingWrite {
     pub client_fd: RawFd,
     pub acked: [bool; 4],      // index = node_id
     pub started_at: Instant,
+}
+impl Conn {
+    pub fn new(fd: RawFd, stream: Option<TcpStream>, conn_type: ConnType) -> Self {
+        // Construct and return the Conn instance
+        Self {
+            fd,                     
+            stream,                 
+            conn_type,              
+            input_buffer: Vec::new(),  
+            output_buffer: Vec::new(), 
+        }
+    }
 }
