@@ -16,7 +16,6 @@ pub struct CoreRaftNetwork {
 }
 
 impl CoreRaftNetwork {
-
     pub fn calculate_peer_port(node_id : u64 , core_id: usize)-> u16 {
         9000 + (node_id as u16 * 10) + (core_id as u16) 
     }
@@ -80,28 +79,21 @@ impl CoreRaftNetwork {
                 
                 let expected_payload_size = match msg_type {
                     TYPE_REQ_VOTE => 16,   // term (8b) + candidate_id (8b) = 16
-                    
                     TYPE_VOTE_RESP => 17,  
-                    
                     TYPE_APP_ENTRIES => 16, // term (8b) + leader_id (8b) = 16
-                    
                     TYPE_APP_RESP => 17,   
-                    
                     5 => {
                         // 1. Read the 8-byte id first
                         let mut id_buf = [0u8; 8];
                         if stream.read_exact(&mut id_buf).is_err() { return None; }
-                    
                         // 2. Then the 3 header bytes: is_delete, key_len, val_len
                         let mut data_header = [0u8; 3];
                         if stream.read_exact(&mut data_header).is_err() { return None; }
                         let key_size = data_header[1] as usize;
                         let val_size = data_header[2] as usize;
-                    
                         // 3. Then the key and value bytes
                         let mut body_buf = vec![0u8; key_size + val_size];
                         if stream.read_exact(&mut body_buf).is_err() { return None; }
-                    
                         // 4. Return id + header + body, in that order
                         let mut full_payload = Vec::with_capacity(8 + 3 + key_size + val_size);
                         full_payload.extend_from_slice(&id_buf);

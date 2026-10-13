@@ -98,7 +98,7 @@ pub fn handle_peer_message(
             net.send_packet(hb_req.leader_id, message::TYPE_APP_RESP, &ack_buf[1..size]);
         }
         
-                                                   // CASE 4: FOLLOWER ACKNOWLEDGED OUR HEARTBEAT PULSE
+        // CASE 4: FOLLOWER ACKNOWLEDGED OUR HEARTBEAT PULSE
         message::TYPE_APP_RESP => {
             // Convert wire buffer bytes back into our response struct frame
             let resp = AppendEntriesResponse::from_bytes(&wire_buffer);

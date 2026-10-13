@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
-    println!(" [Launcher] Compiling your main Key-Value Reactor in Release Mode...");
+    println!("[Launcher] Compiling your main Key-Value Reactor in Release Mode...");
     
     // 1. Force a clean Cargo release build first so the binary is fully ready
     let build_status = Command::new("cargo")
@@ -14,11 +14,11 @@ fn main() {
         .expect("Failed to execute cargo build command");
 
     if !build_status.success() {
-        eprintln!("❌ [Launcher] Compilation failed. Aborting cluster deployment.");
+        eprintln!("[Launcher] Compilation failed. Aborting cluster deployment.");
         std::process::exit(1);
     }
 
-    println!(" [Launcher] Launching 4 Isolated Cluster Nodes concurrently...");
+    println!("[Launcher] Launching 4 Isolated Cluster Nodes concurrently...");
 
     // 2. Loop through Node IDs 0 to 3 to spawn them in separate hardware streams
     for node_id in 0..4 {
@@ -46,7 +46,7 @@ fn main() {
                     "--",
                     "bash",
                     "-c",
-                    &format!("target/release/core-reactor-kv {}; echo '⚠️ Process exited! Press Enter to close window...'; read", node_str)
+                    &format!("target/release/core-reactor-kv {}; echo ' Process exited! Press Enter to close window...'; read", node_str)
                 ])
                 .spawn()
                 .expect("Failed to spawn Linux gnome-terminal window");

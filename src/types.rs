@@ -1,6 +1,6 @@
-use std::os::fd::{AsRawFd, RawFd};
-use std::net::{TcpListener, TcpStream};
-use std::time::{Duration, Instant};
+use std::os::fd::{RawFd};
+use std::net::{TcpStream};
+use std::time::{Instant};
 
 
 #[derive(Debug)]
