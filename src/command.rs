@@ -49,7 +49,7 @@ pub fn execute_command(
                 String::new()                          // empty = answer later
             } else {
                 match raft_state.leader_id {
-                    Some(leader_id) => format!("-ERR MOVED TO NODE {}\r\n", leader_id),
+                    Some(leader_id) => format!("-MOVED {} 127.0.0.1:{}\r\n", leader_id, 8080 + leader_id),
                     None => "-ERR LEADER_UNAVAILABLE_TRY_AGAIN\r\n".to_string(),
                 }
             }
