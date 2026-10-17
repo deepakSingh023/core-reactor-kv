@@ -1,0 +1,5 @@
+ops=98766 ops/s=9877 p50=4.44ms p99=14.69ms errors=0
+ops=278211 ops/s=27821 p50=1.49ms p99=7.01ms errors=0
+ops=228102 ops/s=22810 p50=1.98ms p99=5.88ms errors=0
+ops=195483 ops/s=19548 p50=2.33ms p99=6.87ms errors=0
+ops=186259 ops/s=18626 p50=2.42ms p99=7.59ms errors=0

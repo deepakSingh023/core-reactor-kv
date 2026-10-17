@@ -57,6 +57,7 @@ pub fn reply_to_client(connections: &mut HashMap<RawFd, Conn>, fd: RawFd, msg: &
     }
 }
 
+
 pub fn bind_client_listener(port: u64) -> std::io::Result<TcpListener> { 
             //Instead of blindly opening a listener it goes into linux kernel and get a raw unconfigured network file descriptor
             let socket = socket2::Socket::new(socket2::Domain::IPV4,socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;

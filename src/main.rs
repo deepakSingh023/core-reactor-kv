@@ -144,7 +144,7 @@ fn main() -> Result<(), std::io::Error> {
 
                 let epoll_count = match epoll.wait(
                     &mut events,
-                    timeout // ✨ Fixed cleanly!
+                    timeout 
                 ) {
                     Ok(count) => count,
                     Err(e) => {

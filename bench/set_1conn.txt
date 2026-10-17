@@ -1,0 +1,5 @@
+ops=54966 ops/s=5497 p50=0.18ms p99=0.34ms errors=0
+ops=45495 ops/s=4550 p50=0.19ms p99=1.00ms errors=0
+ops=34652 ops/s=3465 p50=0.23ms p99=1.97ms errors=0
+ops=35639 ops/s=3564 p50=0.23ms p99=1.83ms errors=0
+ops=36085 ops/s=3608 p50=0.23ms p99=1.75ms errors=0
